@@ -1,5 +1,21 @@
 apply plugin: 'com.android.application'
 
+def keystoreProperties = new Properties()
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
+def releaseStorePath = keystoreProperties.getProperty('storeFile') ?: System.getenv('ANDROID_KEYSTORE_PATH')
+def releaseStorePassword = keystoreProperties.getProperty('storePassword') ?: System.getenv('ANDROID_KEYSTORE_PASSWORD')
+def releaseKeyAlias = keystoreProperties.getProperty('keyAlias') ?: System.getenv('ANDROID_KEY_ALIAS')
+def releaseKeyPassword = keystoreProperties.getProperty('keyPassword') ?: System.getenv('ANDROID_KEY_PASSWORD')
+def releaseStoreFile = releaseStorePath ? (new File(releaseStorePath).isAbsolute() ? new File(releaseStorePath) : rootProject.file(releaseStorePath)) : null
+def hasReleaseSigning = releaseStoreFile != null && releaseStoreFile.exists() && releaseStorePassword && releaseKeyAlias && releaseKeyPassword
+
+def resolvedVersionCode = (project.findProperty('versionCode') ?: System.getenv('ANDROID_VERSION_CODE') ?: '1').toString().toInteger()
+def resolvedVersionName = (project.findProperty('versionName') ?: System.getenv('ANDROID_VERSION_NAME') ?: '1.0.0').toString()
+
 android {
     namespace = "mx.org.sntss.normativa"
     compileSdk = rootProject.ext.compileSdkVersion
@@ -7,8 +23,8 @@ android {
         applicationId "mx.org.sntss.normativa"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
-        versionCode 1
-        versionName "1.0"
+        versionCode resolvedVersionCode
+        versionName resolvedVersionName
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         aaptOptions {
              // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
@@ -16,10 +32,25 @@ android {
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
     }
+    signingConfigs {
+        if (hasReleaseSigning) {
+            release {
+                storeFile releaseStoreFile
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                enableV1Signing true
+                enableV2Signing true
+            }
+        }
+    }
     buildTypes {
         release {
+            if (hasReleaseSigning) {
+                signingConfig signingConfigs.release
+            }
             minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
     }
 }

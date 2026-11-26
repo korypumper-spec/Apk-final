@@ -9,6 +9,7 @@
     "ingest": "tsx server/ingest.ts",
     "export:offline": "tsx server/export-static.ts",
     "android:sync": "npm run export:offline && npm run build && npx cap sync android",
+    "android:bundle": "npm run android:sync && cd android && ./gradlew bundleRelease",
     "ios:sync": "npm run export:offline && npm run build && npx cap sync ios",
     "cap:sync": "npm run export:offline && npm run build && npx cap sync",
     "build": "vite build",

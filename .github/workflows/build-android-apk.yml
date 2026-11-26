@@ -1,16 +1,23 @@
-
-name: Build Android APK (Offline)
+name: Build Android (APK + Play Store AAB)
 
 on:
   workflow_dispatch:
+    inputs:
+      version_code:
+        description: 'Version Code entero incremental para Play Store (por defecto usa github.run_number)'
+        required: false
+        default: ''
+        type: string
+      version_name:
+        description: 'Version Name visible en Play Store (ej. 1.0.0)'
+        required: false
+        default: '1.0.0'
+        type: string
   push:
     branches: [main, master]
 
-permissions:
-  contents: read
-
 jobs:
-  build-apk:
+  build-android:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,45 +33,143 @@ jobs:
       - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
+          distribution: 'temurin'
           java-version: '21'
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK (API 36)
         uses: android-actions/setup-android@v3
 
-      - name: Install Android SDK
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install Android SDK 36 Platform and Build Tools
         run: |
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Generate offline database and synchronize Android
-        run: npm run android:sync
-
-      - name: Verify offline resources
+      - name: Install npm dependencies
         run: |
-          test -s dist/index.html
-          test -s dist/data/normativa-offline.json
-          test -s dist/pdf.worker.min.mjs
-          test -s android/app/src/main/assets/public/index.html
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
-      - name: Compile APK
+      - name: Ensure offline bundle and PDF worker exist
+        run: |
+          if [ ! -f public/data/normativa-offline.json ]; then
+            npm run ingest
+            npm run export:offline
+          fi
+          cp node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs public/pdf.worker.min.mjs
+
+      - name: TypeScript check, Vite build and Capacitor Android sync
+        run: |
+          npm run lint
+          npm run build
+          npx cap sync android
+
+      - name: Verify complete offline bundle inside Android assets
+        run: |
+          test -f android/app/src/main/assets/public/index.html
+          test -f android/app/src/main/assets/public/privacy-policy.html
+          test -f android/app/src/main/assets/public/data/normativa-offline.json
+          test -f android/app/src/main/assets/public/pdf.worker.min.mjs
+          test -f android/app/src/main/assets/public/assets/aistudio/CCT_2025-2027_6a8763f8.pdf
+          test -f android/app/src/main/assets/public/assets/aistudio/estatutos-sntss-rcci-image_9b29b255.pdf
+          test -f android/app/src/main/assets/public/assets/aistudio/a_clean_transparent_background_png_style_illustrat_7ae40feb.png
+          ls -lh android/app/src/main/assets/public/data/normativa-offline.json android/app/src/main/assets/public/pdf.worker.min.mjs
+
+      - name: Check Release signing secrets
+        id: signing
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ] && [ -n "$KEYSTORE_PASS" ] && [ -n "$KEY_ALIAS" ] && [ -n "$KEY_PASS" ]; then
+            KEYSTORE_FILE="$RUNNER_TEMP/upload-keystore.jks"
+            python3 -c 'import base64,os,sys; sys.stdout.buffer.write(base64.b64decode(os.environ["KEYSTORE_B64"]))' > "$KEYSTORE_FILE"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+            echo "keystore_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "keystore_path=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve Android versionCode and versionName
+        id: version
+        env:
+          INPUT_CODE: ${{ github.event.inputs.version_code }}
+          INPUT_NAME: ${{ github.event.inputs.version_name }}
+        run: |
+          CODE="${INPUT_CODE:-${{ github.run_number }}}"
+          NAME="${INPUT_NAME:-1.0.${{ github.run_number }}}"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "Compilando Android versionCode=$CODE versionName=$NAME (signed=${{ steps.signing.outputs.signed }})"
+
+      - name: Compile Debug APK
         working-directory: android
         run: |
           chmod +x gradlew
-          ./gradlew --no-daemon clean assembleDebug
+          ./gradlew assembleDebug \
+            -PversionCode="${{ steps.version.outputs.code }}" \
+            -PversionName="${{ steps.version.outputs.name }}"
 
-      - name: Verify APK
+      - name: Compile Play Store App Bundle (AAB)
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.signing.outputs.keystore_path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          test -s android/app/build/outputs/apk/debug/app-debug.apk
-          $ANDROID_HOME/build-tools/36.0.0/apksigner verify --verbose android/app/build/outputs/apk/debug/app-debug.apk
+          ./gradlew bundleRelease \
+            -PversionCode="${{ steps.version.outputs.code }}" \
+            -PversionName="${{ steps.version.outputs.name }}"
 
-      - name: Upload APK
+      - name: Compile Signed Release APK (when keystore is configured)
+        if: steps.signing.outputs.signed == 'true'
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.signing.outputs.keystore_path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease \
+            -PversionCode="${{ steps.version.outputs.code }}" \
+            -PversionName="${{ steps.version.outputs.name }}"
+
+      - name: Cleanup temporary keystore file
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/upload-keystore.jks" || true
+
+      - name: Upload Debug APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: normativa-imss-sntss-offline-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 14
+
+      - name: Upload Play Store AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: normativa-imss-sntss-playstore-aab
+          path: android/app/build/outputs/bundle/release/app-release.aab
+
+      - name: Upload Signed Release APK Artifact
+        if: steps.signing.outputs.signed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: normativa-imss-sntss-release-signed-apk
+          path: android/app/build/outputs/apk/release/app-release.apk

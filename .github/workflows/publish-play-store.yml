@@ -1,0 +1,197 @@
+name: Publish Android to Google Play Store
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: 'Canal (track) de Google Play Store'
+        required: true
+        default: 'internal'
+        type: choice
+        options:
+          - internal
+          - alpha
+          - beta
+          - production
+      release_status:
+        description: 'Estado del lanzamiento en Play Console'
+        required: true
+        default: 'draft'
+        type: choice
+        options:
+          - draft
+          - completed
+          - inProgress
+          - halted
+      version_code:
+        description: 'Version Code entero (debe ser mayor al publicado previamente; vacío usa github.run_number)'
+        required: false
+        default: ''
+        type: string
+      version_name:
+        description: 'Version Name visible en Play Store (ej. 1.0.0)'
+        required: false
+        default: '1.0.0'
+        type: string
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-play-store:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Play Store signing & API secrets
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PLAY_SA_JSON: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          MISSING=0
+          for VAR in KEYSTORE_B64 KEYSTORE_PASS KEY_ALIAS KEY_PASS PLAY_SA_JSON; do
+            if [ -z "${!VAR}" ]; then
+              echo "::error::Falta configurar el secret requerido para publicar en Play Store ($VAR). Consulta ANDROID_PLAYSTORE.md."
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Android SDK (API 36)
+        uses: android-actions/setup-android@v3
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      - name: Install Android SDK 36 Platform and Build Tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Install npm dependencies
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Ensure offline bundle and PDF worker exist
+        run: |
+          if [ ! -f public/data/normativa-offline.json ]; then
+            npm run ingest
+            npm run export:offline
+          fi
+          cp node_modules/pdfjs-dist/legacy/build/pdf.worker.min.mjs public/pdf.worker.min.mjs
+
+      - name: TypeScript check, Vite build and Capacitor Android sync
+        run: |
+          npm run lint
+          npm run build
+          npx cap sync android
+
+      - name: Verify offline assets inside Android project
+        run: |
+          test -f android/app/src/main/assets/public/index.html
+          test -f android/app/src/main/assets/public/privacy-policy.html
+          test -f android/app/src/main/assets/public/data/normativa-offline.json
+          test -f android/app/src/main/assets/public/pdf.worker.min.mjs
+          test -f android/app/src/main/assets/public/assets/aistudio/CCT_2025-2027_6a8763f8.pdf
+          test -f android/app/src/main/assets/public/assets/aistudio/estatutos-sntss-rcci-image_9b29b255.pdf
+          test -f android/app/src/main/assets/public/assets/aistudio/a_clean_transparent_background_png_style_illustrat_7ae40feb.png
+
+      - name: Resolve release metadata and decode credentials
+        id: release
+        env:
+          INPUT_CODE: ${{ github.event.inputs.version_code }}
+          INPUT_NAME: ${{ github.event.inputs.version_name }}
+          INPUT_TRACK: ${{ github.event.inputs.track }}
+          INPUT_STATUS: ${{ github.event.inputs.release_status }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PLAY_SA_JSON: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+        run: |
+          CODE="${INPUT_CODE:-${{ github.run_number }}}"
+          if [ "$REF_TYPE" = "tag" ]; then
+            CLEAN_TAG="${REF_NAME#v}"
+            NAME="${INPUT_NAME:-$CLEAN_TAG}"
+          else
+            NAME="${INPUT_NAME:-1.0.${{ github.run_number }}}"
+          fi
+          TRACK="${INPUT_TRACK:-internal}"
+          STATUS="${INPUT_STATUS:-draft}"
+
+          KEYSTORE_FILE="$RUNNER_TEMP/upload-keystore.jks"
+          SA_FILE="$RUNNER_TEMP/play-service-account.json"
+
+          python3 -c 'import base64,os,sys; sys.stdout.buffer.write(base64.b64decode(os.environ["KEYSTORE_B64"]))' > "$KEYSTORE_FILE"
+          printf '%s' "$PLAY_SA_JSON" > "$SA_FILE"
+
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "track=$TRACK" >> "$GITHUB_OUTPUT"
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          echo "keystore_path=$KEYSTORE_FILE" >> "$GITHUB_OUTPUT"
+          echo "sa_path=$SA_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Build and Sign Release AAB for Play Store
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ steps.release.outputs.keystore_path }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew bundleRelease \
+            -PversionCode="${{ steps.release.outputs.code }}" \
+            -PversionName="${{ steps.release.outputs.name }}"
+
+      - name: Upload Signed Release AAB Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: normativa-imss-sntss-playstore-release-v${{ steps.release.outputs.name }}-${{ steps.release.outputs.code }}
+          path: android/app/build/outputs/bundle/release/app-release.aab
+
+      - name: Upload AAB to Google Play Console
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJson: ${{ steps.release.outputs.sa_path }}
+          packageName: mx.org.sntss.normativa
+          releaseFiles: android/app/build/outputs/bundle/release/app-release.aab
+          track: ${{ steps.release.outputs.track }}
+          status: ${{ steps.release.outputs.status }}
+          releaseName: v${{ steps.release.outputs.name }} (${{ steps.release.outputs.code }})
+          inAppUpdatePriority: 2
+
+      - name: Cleanup temporary credentials
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/upload-keystore.jks" "$RUNNER_TEMP/play-service-account.json" || true

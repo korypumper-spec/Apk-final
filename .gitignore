@@ -10,3 +10,9 @@ coverage/
 ios/App/Payload/
 ios/App/*.ipa
 ios/App/.spm-cache/
+*.jks
+*.keystore
+keystore.properties
+*play-service-account*.json
+*.apk
+*.aab
